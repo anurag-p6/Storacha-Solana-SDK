@@ -1,197 +1,118 @@
 /**
- * Algorand x402 Middleware
+ * Algorand x402 Middleware — GoPlausible Facilitator
  *
- * This is the server-side "facilitator" for Algorand payments. Because there is
- * no official @x402/algorand package, we implement the protocol manually:
+ * Replaces the previous hand-rolled implementation with the official
+ * @x402/express + @x402/avm stack, delegating payment verification and
+ * settlement to GoPlausible's hosted facilitator.
  *
- * ┌─────────────────────────────────────────────────────────────────┐
- * │  First request (no X-PAYMENT header)                            │
- * │   → Compute required microALGO from ?size + ?duration           │
- * │   → Return HTTP 402 with Algorand payment requirement           │
- * │                                                                 │
- * │  Retry request (X-PAYMENT: algorand <base64-signed-txn>)        │
- * │   → Decode the base64 signed transaction bytes                  │
- * │   → Attach to req for the controller to verify + record         │
- * │   → Call next() — controller takes over                         │
- * └─────────────────────────────────────────────────────────────────┘
+ * Flow (handled entirely by the middleware + facilitator):
+ *   1. First request (no X-PAYMENT) → middleware returns HTTP 402 with
+ *      Algorand payment requirements (amount, recipient, network)
+ *   2. Client builds, signs, and submits the Algorand tx via @x402/avm
+ *   3. Client retries with X-PAYMENT header containing the signed tx payload
+ *   4. Middleware forwards to GoPlausible facilitator → /verify then /settle
+ *   5. On success → next() is called → controller takes over
  *
- * The client (packages/algo) is responsible for:
- *   1. Receiving the 402
- *   2. Building + signing + SUBMITTING the Algorand payment tx on-chain
- *   3. Waiting for confirmation
- *   4. Re-sending the request with the signed tx bytes in X-PAYMENT
- *
- * The server does NOT submit the transaction — it only verifies an already-confirmed one.
- * This avoids double-spend: by the time X-PAYMENT arrives, the tx is already on-chain.
+ * The server never touches private keys or submits transactions.
+ * GoPlausible's facilitator handles on-chain confirmation and fee abstraction.
  */
 
-import { RequestHandler } from 'express'
-import { getAlgoPrice } from '../services/price/algo-price.service.js'
+import {
+  ALGORAND_MAINNET_GENESIS_HASH,
+  ALGORAND_TESTNET_GENESIS_HASH,
+} from '@x402/avm'
+import { ExactAvmScheme } from '@x402/avm/exact/server'
+import { HTTPFacilitatorClient, x402ResourceServer } from '@x402/core/server'
+import type { Network } from '@x402/core/types'
+import { paymentMiddleware } from '@x402/express'
 import { getAmountInUSD } from '../utils/constant.js'
 import { logger } from '../utils/logger.js'
 import { getPricingConfig } from '../utils/pricing.js'
 
 const isMainnet = process.env.ALGO_NETWORK === 'mainnet'
-const ALGO_NETWORK = isMainnet ? 'mainnet' : 'testnet'
+const ALGO_NETWORK = (
+  isMainnet
+    ? `algorand:${ALGORAND_MAINNET_GENESIS_HASH}`
+    : `algorand:${ALGORAND_TESTNET_GENESIS_HASH}`
+) as Network
 
-/** Your server's Algorand receiving address (set ALGO_WALLET_ADDRESS in .env) */
+/** Server's Algorand receiving address */
 const ALGO_RECIPIENT = process.env.ALGO_WALLET_ADDRESS
 
 /**
- * Shape of the 402 response body.
- * Clients parse `accepts[0]` to know where to send ALGO and how much.
+ * GoPlausible hosted facilitator — handles verify + settle for Algorand.
+ * Override with ALGO_FACILITATOR_URL env var to use a self-hosted facilitator.
  */
-interface AlgoPaymentRequirement {
-  scheme: 'algorand'
-  network: typeof ALGO_NETWORK
-  /** Amount required, in microALGO (1 ALGO = 1,000,000 microALGO) */
-  maxAmountRequired: string
-  asset: 'ALGO'
-  recipient: string
-  /** Human-readable memo that the client should include in the transaction note */
-  memo: string
-}
+const FACILITATOR_URL =
+  process.env.ALGO_FACILITATOR_URL ?? 'https://facilitator.goplausible.xyz'
 
-/**
- * Augmented Express request — set by this middleware so the controller
- * can access the decoded payment bytes and derived tx metadata.
- */
-export interface AlgoPaymentRequest {
-  /** Raw signed-transaction bytes decoded from the X-PAYMENT header */
-  algoSignedTxnBytes: Uint8Array
-  /** Required microALGO amount computed from size + duration */
-  algoRequiredMicroAlgo: number
-  /** The recipient address the client must have paid to */
-  algoRecipient: string
-}
+let algoX402Middleware: ReturnType<typeof paymentMiddleware> | null = null
 
-/**
- * Returns an Express middleware that guards the route with Algorand x402.
- *
- * Mount it directly on the route — not router-wide — so only /algo-agent is gated:
- *
- *   uploadsRouter.post('/algo-agent', upload.single('file'), algoX402Middleware(), controller)
- */
-export function algoX402Middleware(): RequestHandler {
-  if (!ALGO_RECIPIENT) {
-    logger.warn(
-      'ALGO_WALLET_ADDRESS is not set — POST /upload/algo-agent will not require payment',
+if (!ALGO_RECIPIENT) {
+  logger.warn(
+    'ALGO_WALLET_ADDRESS is not set — POST /upload/algo-agent will not require payment',
+  )
+} else {
+  try {
+    const facilitatorClient = new HTTPFacilitatorClient({
+      url: FACILITATOR_URL,
+    })
+
+    // Register the AVM exact scheme on the resource server
+    const server = new x402ResourceServer(facilitatorClient).register(
+      ALGO_NETWORK,
+      new ExactAvmScheme(),
     )
-  }
 
-  return async (req, res, next) => {
-    // ── Parse size / duration from query ──────────────────────────────────────
-    const sizeBytes = parseInt((req.query.size as string) || '0', 10)
-    const durationDays = parseInt((req.query.duration as string) || '1', 10)
-
-    if (isNaN(sizeBytes) || sizeBytes <= 0) {
-      res.status(400).json({ error: '"size" query param is required (bytes)' })
-      return
-    }
-    if (isNaN(durationDays) || durationDays <= 0) {
-      res
-        .status(400)
-        .json({ error: '"duration" query param is required (days)' })
-      return
-    }
-
-    // ── Skip payment gate if wallet not configured (dev/staging convenience) ──
-    if (!ALGO_RECIPIENT) {
-      return next()
-    }
-
-    const xPayment = req.headers['x-payment'] as string | undefined
-
-    // ── No payment header → issue 402 with Algorand payment details ───────────
-    if (!xPayment?.startsWith('algorand ')) {
-      try {
-        const { ratePerBytePerDay } = await getPricingConfig()
-        const costUSD = Math.max(
-          getAmountInUSD(sizeBytes, ratePerBytePerDay, durationDays),
-          0.000001, // floor to avoid zero-price edge cases
-        )
-
-        const algoUsdPrice = await getAlgoPrice()
-        const microAlgoRequired = Math.ceil(
-          (costUSD / algoUsdPrice) * 1_000_000,
-        )
-
-        const requirement: AlgoPaymentRequirement = {
-          scheme: 'algorand',
-          network: ALGO_NETWORK,
-          maxAmountRequired: String(microAlgoRequired),
-          asset: 'ALGO',
-          recipient: ALGO_RECIPIENT,
-          memo: `toju-${sizeBytes}-${durationDays}`,
-        }
-
-        logger.info('Algorand x402: returning 402', {
-          sizeBytes,
-          durationDays,
-          costUSD,
-          microAlgoRequired,
-          recipient: ALGO_RECIPIENT,
-        })
-
-        res.status(402).json({
-          x402Version: 1,
-          error: 'Payment required',
-          accepts: [requirement],
-        })
-        return
-      } catch (err) {
-        logger.error(
-          'Algorand x402: failed to compute price for 402 response',
-          {
-            error: err instanceof Error ? err.message : String(err),
+    algoX402Middleware = paymentMiddleware(
+      {
+        'POST /algo-agent': {
+          accepts: {
+            scheme: 'exact',
+            network: ALGO_NETWORK,
+            payTo: ALGO_RECIPIENT,
+            /**
+             * Dynamic pricing: reads ?size and ?duration from query params,
+             * computes cost in USD from the DB config rate, returns as "$X.XXXXXX".
+             */
+            price: async (context) => {
+              const sizeParam = context.adapter.getQueryParam?.('size')
+              const durationParam = context.adapter.getQueryParam?.('duration')
+              const size = parseInt(
+                (Array.isArray(sizeParam) ? sizeParam[0] : sizeParam) || '0',
+                10,
+              )
+              const duration = parseInt(
+                (Array.isArray(durationParam)
+                  ? durationParam[0]
+                  : durationParam) || '1',
+                10,
+              )
+              const { ratePerBytePerDay } = await getPricingConfig()
+              const costUSD = getAmountInUSD(size, ratePerBytePerDay, duration)
+              // floor at $0.000001 to avoid zero-price edge cases on tiny files
+              return `$${Math.max(costUSD, 0.000001).toFixed(6)}`
+            },
           },
-        )
-        res.status(500).json({ error: 'Failed to compute payment requirement' })
-        return
-      }
-    }
-
-    // ── Payment header present → decode and attach to request ─────────────────
-    try {
-      const base64Txn = xPayment.replace('algorand ', '').trim()
-      const signedTxnBytes = Uint8Array.from(Buffer.from(base64Txn, 'base64'))
-
-      // Compute the required amount again so the controller can verify it
-      const { ratePerBytePerDay } = await getPricingConfig()
-      const costUSD = Math.max(
-        getAmountInUSD(sizeBytes, ratePerBytePerDay, durationDays),
-        0.000001,
-      )
-      const algoUsdPrice = await getAlgoPrice()
-      const microAlgoRequired = Math.ceil((costUSD / algoUsdPrice) * 1_000_000)
-
-      // Attach decoded payment data to the request object
-      const algoReq = req as typeof req & AlgoPaymentRequest
-      algoReq.algoSignedTxnBytes = signedTxnBytes
-      algoReq.algoRequiredMicroAlgo = microAlgoRequired
-      algoReq.algoRecipient = ALGO_RECIPIENT
-
-      logger.info(
-        'Algorand x402: payment header decoded, passing to controller',
-        {
-          sizeBytes,
-          durationDays,
-          microAlgoRequired,
+          description: 'Algorand x402 IPFS storage upload',
         },
-      )
+      },
+      server,
+    )
 
-      return next()
-    } catch (err) {
-      logger.error('Algorand x402: failed to decode X-PAYMENT header', {
-        error: err instanceof Error ? err.message : String(err),
-      })
-      res
-        .status(400)
-        .json({
-          error:
-            'Invalid X-PAYMENT header — could not decode signed transaction',
-        })
-      return
-    }
+    logger.info(
+      'Algorand x402 middleware initialised (GoPlausible facilitator)',
+      {
+        network: ALGO_NETWORK,
+        facilitator: FACILITATOR_URL,
+        payTo: ALGO_RECIPIENT,
+      },
+    )
+  } catch (err) {
+    logger.error('Failed to initialise Algorand x402 middleware', {
+      error: err,
+    })
   }
 }
+
+export { algoX402Middleware }

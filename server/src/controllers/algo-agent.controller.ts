@@ -1,17 +1,19 @@
 /**
- * Algorand Agent Upload Controller
+ * Algorand Agent Upload Controller — GoPlausible x402
  *
  * Runs AFTER algoX402Middleware() has:
  *   - Returned a 402 to the client (first request, no X-PAYMENT)
- *   - Decoded the signed transaction bytes from X-PAYMENT (second request)
- *   - Attached algoSignedTxnBytes, algoRequiredMicroAlgo, algoRecipient to req
+ *   - Forwarded the signed tx to GoPlausible's facilitator for verify + settle
+ *   - Called next() on successful settlement
+ *
+ * Payment is fully verified by the facilitator before this controller runs.
+ * No on-chain verification happens here — the facilitator handles it.
  *
  * This controller:
- *   1. Verifies the Algorand payment is on-chain (calls verify.service.ts)
- *   2. Deduplicates by CID (same as the EVM agent controller)
- *   3. Pins the file to IPFS via Pinata
- *   4. Records the upload in the DB with paymentChain = 'algo'
- *   5. Returns { cid, expiresAt, fileName, fileSize, paymentTxId }
+ *   1. Computes CID and deduplicates
+ *   2. Pins the file to IPFS via Pinata
+ *   3. Records the upload in the DB with paymentChain = 'algo'
+ *   4. Returns { cid, expiresAt, fileName, fileSize, paymentTxId }
  */
 
 import * as Sentry from '@sentry/node'
@@ -19,9 +21,7 @@ import { eq } from 'drizzle-orm'
 import { Request, Response } from 'express'
 import { db } from '../db/db.js'
 import { uploads } from '../db/schema.js'
-import { verifyAlgoPayment } from '../services/algo/verify.service.js'
 import { pinFiles } from '../services/storage/pinata.service.js'
-import { AlgoPaymentRequest } from '../middlewares/algo-x402.middleware.js'
 import { computeCID } from '../utils/compute-cid.js'
 import { getAmountInUSD } from '../utils/constant.js'
 import { getExpiryDate } from '../utils/functions.js'
@@ -31,12 +31,8 @@ import { getPricingConfig } from '../utils/pricing.js'
 /**
  * POST /upload/algo-agent?size=<bytes>&duration=<days>
  *
- * Protected by algoX402Middleware(). By the time this runs:
- *   - X-PAYMENT has been validated structurally (base64 decodes cleanly)
- *   - req.algoSignedTxnBytes, req.algoRequiredMicroAlgo, req.algoRecipient are set
- *
- * We still run full on-chain verification here so payment is confirmed before
- * any IPFS pinning or DB writes happen.
+ * Protected by algoX402Middleware(). Payment is verified and settled
+ * by GoPlausible's facilitator before this handler is called.
  */
 export const uploadAlgoAgentFile = async (req: Request, res: Response) => {
   try {
@@ -64,15 +60,31 @@ export const uploadAlgoAgentFile = async (req: Request, res: Response) => {
       return
     }
 
-    // Cast request to access fields attached by the middleware
-    const algoReq = req as Request & AlgoPaymentRequest
+    // ── Step 1: Extract payment details from X-PAYMENT header ─────────────────
+    const xPayment = req.headers['x-payment'] as string | undefined
+    let txId = `x402:algo:${Date.now()}`
+    let senderAddress = 'algo-agent'
 
-    // ── Step 1: Verify the Algorand payment on-chain ───────────────────────────
-    const { txId, senderAddress, amountPaid } = await verifyAlgoPayment(
-      algoReq.algoSignedTxnBytes,
-      algoReq.algoRecipient,
-      algoReq.algoRequiredMicroAlgo,
-    )
+    try {
+      const paymentInfo = JSON.parse(
+        Buffer.from(xPayment ?? '', 'base64').toString('utf8'),
+      )
+      const signedTxnBase64 = paymentInfo?.payload?.signedTransaction
+      if (signedTxnBase64) {
+        const algosdk = await import('algosdk')
+        const signedTxnBytes = Uint8Array.from(
+          Buffer.from(signedTxnBase64, 'base64'),
+        )
+        const decodedTxn =
+          algosdk.default.decodeSignedTransaction(signedTxnBytes)
+        txId = decodedTxn.txn.txID()
+        senderAddress = algosdk.default.encodeAddress(
+          decodedTxn.txn.sender.publicKey,
+        )
+      }
+    } catch {
+      // fallback to synthetic values — payment is already verified by facilitator
+    }
 
     // ── Step 2: Compute CID and check for duplicates ───────────────────────────
     const fileMap: Record<string, Uint8Array> = {
@@ -115,25 +127,21 @@ export const uploadAlgoAgentFile = async (req: Request, res: Response) => {
 
     // ── Step 4: Write upload record to DB ─────────────────────────────────────
     const expiresAt = getExpiryDate(duration)
-
     const { ratePerBytePerDay } = await getPricingConfig()
     const costUSD = Math.max(
       getAmountInUSD(size, ratePerBytePerDay, duration),
       0.000001,
     )
 
-    // Store depositAmount in microALGO (analogous to microUSDC for Base uploads)
-    const depositAmount = amountPaid
-
     const depositItem: typeof uploads.$inferInsert = {
-      depositAmount,
+      depositAmount: Math.ceil(costUSD * 1_000_000), // store in micro-units
       durationDays: duration,
       contentCid: computedCID,
       depositKey: senderAddress,
       depositSlot: 1,
       lastClaimedSlot: 1,
       expiresAt,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date().toISOString().split('T')[0],
       userEmail: null,
       fileName: file.originalname,
       fileType: file.mimetype,
@@ -147,13 +155,12 @@ export const uploadAlgoAgentFile = async (req: Request, res: Response) => {
 
     await db.insert(uploads).values(depositItem)
 
-    logger.info('Algo agent upload complete', {
+    logger.info('Algo agent upload complete (GoPlausible x402)', {
       cid: computedCID,
       fileSize: file.size,
       duration,
       senderAddress,
       costUSD,
-      amountPaidMicroAlgo: amountPaid,
       txId,
     })
 

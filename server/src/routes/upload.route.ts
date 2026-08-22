@@ -11,8 +11,11 @@ const upload = multer()
 
 export const uploadsRouter = express.Router()
 
-// x402 payment gate — applies only to POST /agent, passes through all other routes
+// EVM x402 payment gate — applies only to POST /agent
 if (agentPaymentMiddleware) uploadsRouter.use(agentPaymentMiddleware)
+
+// Algorand x402 payment gate (GoPlausible facilitator) — applies only to POST /algo-agent
+if (algoX402Middleware) uploadsRouter.use(algoX402Middleware)
 
 uploadsRouter.post(
   '/deposit',
@@ -46,11 +49,8 @@ uploadsRouter.post(
   agentController.uploadAgentFile,
 )
 
-// Algorand x402 — middleware is applied directly on this route only (not router-wide)
-// so it doesn't interfere with any other upload routes.
 uploadsRouter.post(
   '/algo-agent',
   upload.single('file'),
-  algoX402Middleware(),
   algoAgentController.uploadAlgoAgentFile,
 )

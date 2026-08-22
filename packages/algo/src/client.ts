@@ -1,26 +1,29 @@
+import { wrapFetchWithPayment } from '@x402/fetch'
+import {
+  ALGORAND_MAINNET_GENESIS_HASH,
+  ALGORAND_TESTNET_GENESIS_HASH,
+  toClientAvmSigner,
+} from '@x402/avm'
+import { ExactAvmScheme } from '@x402/avm/exact/client'
+import { x402Client } from '@x402/core/client'
+import type { Network } from '@x402/core/types'
 import algosdk from 'algosdk'
 import {
   ALGOD_SERVERS,
   ALGOD_TOKEN_DEFAULT,
-  CONFIRMATION_ROUNDS,
   ENDPOINTS,
   PRICING_ROUTE,
   UPLOAD_ROUTE,
 } from './constants'
 import type {
   AlgoAgentClientOptions,
-  AlgoPaymentRequirement,
   Environment,
-  PaymentRequiredResponse,
   StorageCostEstimate,
   StoreOptions,
   StoreResult,
 } from './types'
 
-/**
- * Cross-platform Uint8Array → base64 encoder.
- * Works in Node.js (≥16) and all modern browsers without importing `Buffer`.
- */
+/** Cross-platform Uint8Array → base64 (works in Node.js and browsers) */
 function uint8ArrayToBase64(bytes: Uint8Array): string {
   let binary = ''
   for (let i = 0; i < bytes.length; i++) {
@@ -30,10 +33,11 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
 }
 
 export class AlgoAgentClient {
-  private readonly account: algosdk.Account
-  private readonly algodClient: algosdk.Algodv2
   private readonly apiEndpoint: string
   private readonly environment: Environment
+  private readonly signer: ReturnType<typeof toClientAvmSigner>
+  private readonly x402: x402Client
+  private readonly network: Network
 
   constructor({
     mnemonic,
@@ -44,40 +48,52 @@ export class AlgoAgentClient {
   }: AlgoAgentClientOptions) {
     this.environment = environment
     this.apiEndpoint = endpoint ?? ENDPOINTS[environment]
+    this.network = `algorand:${
+      environment === 'mainnet'
+        ? ALGORAND_MAINNET_GENESIS_HASH
+        : ALGORAND_TESTNET_GENESIS_HASH
+    }` as Network
 
-    // Derive the Algorand account from the mnemonic
-    this.account = algosdk.mnemonicToSecretKey(mnemonic)
+    // Convert 25-word mnemonic → 64-byte Ed25519 secret key → base64 for @x402/avm
+    const account = algosdk.mnemonicToSecretKey(mnemonic)
+    const base64Key = uint8ArrayToBase64(account.sk)
 
-    // Initialise the algod client — used to fetch tx params and submit payments
-    this.algodClient = new algosdk.Algodv2(
-      algodToken ?? ALGOD_TOKEN_DEFAULT,
-      algodServer ?? ALGOD_SERVERS[environment],
-      '', // port is embedded in the URL for public nodes
-    )
+    // Build the AVM signer (takes base64 private key only)
+    this.signer = toClientAvmSigner(base64Key)
+
+    // Build the ExactAvmScheme — native ALGO payments (asset 0)
+    // spend controls disabled since ALGO is not a default USDC asset
+    const avmScheme = new ExactAvmScheme(this.signer, {
+      algodUrl: algodServer ?? ALGOD_SERVERS[environment],
+      algodToken: (algodToken ?? ALGOD_TOKEN_DEFAULT) || undefined,
+    })
+
+    // Build the x402 client and register the AVM scheme
+    this.x402 = new x402Client()
+    this.x402.register(this.network, avmScheme)
+    this.x402.setSpendControls(false)
   }
 
   /**
    * The Algorand address derived from the provided mnemonic.
-   * Useful for logging or pre-flight balance checks.
    */
   get address(): string {
-    return this.account.addr.toString()
+    return this.signer.address
   }
 
   /**
    * Store a file on IPFS. Payment in ALGO is handled automatically
-   * via the x402 protocol — no wallet popups, no human in the loop.
+   * via the x402 protocol with GoPlausible's facilitator.
    *
-   * Flow:
-   *   1. POST to /upload/algo-agent (no payment header) → server returns 402
-   *   2. Parse the Algorand payment requirement from the 402 body
-   *   3. Build, sign, and submit an Algorand payment transaction
-   *   4. Wait for on-chain confirmation
-   *   5. Retry the upload with the signed transaction in X-PAYMENT header
-   *   6. Server verifies on-chain and pins the file to IPFS
+   * Flow (handled by @x402/fetch + @x402/avm):
+   *   1. POST to /upload/algo-agent → server returns 402 with payment requirements
+   *   2. @x402/avm builds and signs the Algorand payment transaction group
+   *   3. GoPlausible facilitator verifies and settles on-chain (~3s)
+   *   4. @x402/fetch retries with X-PAYMENT header containing the signed payload
+   *   5. Server pins file to IPFS and returns the result
    *
    * @example
-   * const { cid, expiresAt } = await client.store(file, { durationDays: 30 })
+   * const { cid, expiresAt, paymentTxId } = await client.store(file, { durationDays: 30 })
    */
   async store(
     file: File,
@@ -85,105 +101,31 @@ export class AlgoAgentClient {
   ): Promise<StoreResult> {
     const url = `${this.apiEndpoint}${UPLOAD_ROUTE}?size=${file.size}&duration=${durationDays}`
 
-    // ── Step 1: probe the endpoint to receive the 402 payment details ──────────
-    const probeForm = new FormData()
-    probeForm.append('file', file)
+    const form = new FormData()
+    form.append('file', file)
 
-    const probeRes = await fetch(url, { method: 'POST', body: probeForm })
-
-    if (probeRes.status !== 402) {
-      // If we somehow skipped payment (shouldn't happen), handle it gracefully
-      if (probeRes.ok) return probeRes.json() as Promise<StoreResult>
-      const errBody = (await probeRes.json().catch(() => ({}))) as {
-        message?: string
-        error?: string
-      }
-      throw new Error(
-        errBody.message ??
-          errBody.error ??
-          `Unexpected status ${probeRes.status}`,
-      )
-    }
-
-    const paymentRequired = (await probeRes.json()) as PaymentRequiredResponse
-
-    // ── Step 2: select the Algorand payment requirement ────────────────────────
-    const requirement = paymentRequired.accepts.find(
-      (a): a is AlgoPaymentRequirement => a.scheme === 'algorand',
-    )
-    if (!requirement) {
-      throw new Error(
-        'Server does not accept Algorand payments for this endpoint',
-      )
-    }
-
-    const amountMicroAlgo = Number(requirement.maxAmountRequired)
-    if (isNaN(amountMicroAlgo) || amountMicroAlgo <= 0) {
-      throw new Error(
-        `Invalid payment amount from server: ${requirement.maxAmountRequired}`,
-      )
-    }
-
-    // ── Step 3: build + sign the Algorand payment transaction ─────────────────
-    const suggestedParams = await this.algodClient.getTransactionParams().do()
-
-    const paymentTxn = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
-      sender: this.account.addr,
-      receiver: requirement.recipient,
-      amount: amountMicroAlgo,
-      suggestedParams,
-      note: new TextEncoder().encode(
-        requirement.memo ?? `toju-${file.size}-${durationDays}`,
-      ),
-    })
-
-    const signedTxnBytes = paymentTxn.signTxn(this.account.sk)
-
-    // ── Step 4: submit to Algorand and wait for confirmation ──────────────────
-    const submitRes = await this.algodClient
-      .sendRawTransaction(signedTxnBytes)
-      .do()
-    const txId: string = submitRes.txid
-
-    await algosdk.waitForConfirmation(
-      this.algodClient,
-      txId,
-      CONFIRMATION_ROUNDS,
-    )
-
-    // ── Step 5: retry the upload with the payment proof in the header ─────────
-    // Encode the signed transaction bytes as base64 for the X-PAYMENT header.
-    // Uses a cross-platform approach (works in Node.js and browsers alike).
-    const base64SignedTxn = uint8ArrayToBase64(signedTxnBytes)
-
-    const uploadForm = new FormData()
-    uploadForm.append('file', file)
-
-    const uploadRes = await fetch(url, {
+    const response = await wrapFetchWithPayment(fetch, this.x402)(url, {
       method: 'POST',
-      headers: { 'X-PAYMENT': `algorand ${base64SignedTxn}` },
-      body: uploadForm,
+      body: form,
     })
 
-    if (!uploadRes.ok) {
-      const errBody = (await uploadRes.json().catch(() => ({}))) as {
+    if (!response.ok) {
+      const errBody = (await response.json().catch(() => ({}))) as {
         message?: string
         error?: string
       }
       throw new Error(
         errBody.message ??
           errBody.error ??
-          `Upload failed with status ${uploadRes.status}`,
+          `Upload failed with status ${response.status}`,
       )
     }
 
-    const result = (await uploadRes.json()) as Omit<StoreResult, 'paymentTxId'>
-    return { ...result, paymentTxId: txId }
+    return response.json() as Promise<StoreResult>
   }
 
   /**
    * Estimate the ALGO cost for storing a file before committing to an upload.
-   * Useful for agents that need to check wallet balance before proceeding.
    *
    * @example
    * const { algo, usd, microAlgo } = await client.estimateStorageCost(1_000_000, 30)
@@ -204,9 +146,6 @@ export class AlgoAgentClient {
       quote: { totalCost: number; algoPrice?: number }
     }
     const totalUsd: number = quote.totalCost
-
-    // Fallback to 0.15 USD/ALGO if the server doesn't return an algoPrice.
-    // Replace with a live oracle feed in production.
     const algoUsdPrice: number = quote.algoPrice ?? 0.15
     const totalAlgo = totalUsd / algoUsdPrice
     const microAlgo = Math.ceil(totalAlgo * 1_000_000)
@@ -219,7 +158,7 @@ export class AlgoAgentClient {
   }
 }
 
-/** Convenience factory function — mirrors the pattern used in @toju.network/x402 */
+/** Convenience factory */
 export function createAlgoAgentClient(
   options: AlgoAgentClientOptions,
 ): AlgoAgentClient {
